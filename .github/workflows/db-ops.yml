@@ -1,0 +1,152 @@
+name: Composa database ops
+
+# Applies the migrations in Composa-App/Composa to composa-staging or production.
+# This is how the cloud lane, which holds no database credentials, gets database
+# work done: it dispatches this workflow and the credentials stay in this
+# repository's environments.
+#
+# - production runs in `composa-production`, so every run waits for the required
+#   reviewer. staging runs in `composa-staging`, with no reviewer.
+# - `apply` defaults to false. A dry run executes every pending file inside one
+#   transaction and rolls it back, so it proves they run without keeping anything.
+# - Applying uses the Supabase CLI, so the migration history stays correct.
+# - It refuses to run when the database records a migration the repo doesn't have.
+#   Production's history needs repairing before it can pass that check.
+# - This log is public. It prints counts, migration versions and psql's ERROR
+#   lines. It never prints query results or row contents.
+
+run-name: 'Composa database ops: ${{ inputs.target }}${{ inputs.apply && '' (apply)'' || '' (dry run)'' }}${{ inputs.sha && format('' at {0}'', inputs.sha) || '''' }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Which project
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+      apply:
+        description: Keep the changes (off = dry run)
+        required: false
+        default: false
+        type: boolean
+      sha:
+        description: Composa commit to take migrations from instead of main (full SHA)
+        required: false
+        type: string
+
+concurrency:
+  # One database job per project at a time; a second waits instead of cancelling.
+  group: composa-db-ops-${{ inputs.target }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.target == 'production' && 'composa-production' || 'composa-staging' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check the secrets match the target
+        env:
+          TARGET: ${{ inputs.target }}
+          DB_URL: ${{ secrets.COMPOSA_DB_URL }}
+        run: |
+          case "$TARGET" in
+            production) want=odoqrbmvwvpuzbifbxnr ;;
+            staging) want=rvhuftpjserbzyyxnmdz ;;
+            *) echo "unknown target"; exit 1 ;;
+          esac
+          [ -n "$DB_URL" ] || { echo "This environment is missing COMPOSA_DB_URL."; exit 1; }
+          [[ "$DB_URL" == *"$want"* ]] || { echo "COMPOSA_DB_URL is not the $TARGET project."; exit 1; }
+          echo "secrets match $TARGET"
+
+      - name: Choose the commit
+        id: ref
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          [ -z "$SHA" ] || [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be a full 40-character commit"; exit 1; }
+          echo "ref=${SHA:-main}" >> "$GITHUB_OUTPUT"
+
+      - id: source
+        uses: ./.github/actions/fetch-source
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          deploy_key: ${{ secrets.COMPOSA_SOURCE_DEPLOY_KEY }}
+
+      - name: Compare the migrations
+        id: plan
+        working-directory: ${{ runner.temp }}/composa-source
+        env:
+          DB_URL: ${{ secrets.COMPOSA_DB_URL }}
+        run: |
+          ls supabase/migrations/*.sql | xargs -n1 basename | sed 's/_.*//' | sort -u > "$RUNNER_TEMP/local"
+          psql "$DB_URL" -X -q -At -c "select version from supabase_migrations.schema_migrations" 2>/dev/null | sort -u > "$RUNNER_TEMP/remote" \
+            || { echo "Could not read the migration history."; exit 1; }
+          unknown="$(comm -13 "$RUNNER_TEMP/local" "$RUNNER_TEMP/remote" | wc -l)"
+          if [ "$unknown" -ne 0 ]; then
+            echo "The database records $unknown migration(s) this commit doesn't have. Nothing was run."
+            echo "Repair the migration history first."
+            exit 1
+          fi
+          comm -23 "$RUNNER_TEMP/local" "$RUNNER_TEMP/remote" > "$RUNNER_TEMP/pending"
+          echo "$(wc -l < "$RUNNER_TEMP/local") in the repo, $(wc -l < "$RUNNER_TEMP/pending") pending:"
+          cat "$RUNNER_TEMP/pending"
+          echo "pending=$(wc -l < "$RUNNER_TEMP/pending")" >> "$GITHUB_OUTPUT"
+
+      - name: Prove the pending files run, then roll back
+        if: steps.plan.outputs.pending != '0'
+        working-directory: ${{ runner.temp }}/composa-source
+        env:
+          DB_URL: ${{ secrets.COMPOSA_DB_URL }}
+        run: |
+          log="$RUNNER_TEMP/psql.log"
+          set +e
+          {
+            echo 'begin;'
+            while read -r version; do cat supabase/migrations/"$version"_*.sql; echo; done < "$RUNNER_TEMP/pending"
+            echo 'rollback;'
+          } | psql "$DB_URL" -X -q -v ON_ERROR_STOP=1 -o /dev/null > "$log" 2>&1
+          status=$?
+          set -e
+          if [ $status -ne 0 ]; then
+            echo "A pending file failed and nothing was kept. psql's errors:"
+            grep -E 'ERROR:' "$log" | cut -c1-300 || true
+            exit 1
+          fi
+          echo "Dry run: the pending files ran without errors and were rolled back."
+
+      - name: Apply
+        if: inputs.apply && steps.plan.outputs.pending != '0'
+        working-directory: ${{ runner.temp }}/composa-source
+        env:
+          DB_URL: ${{ secrets.COMPOSA_DB_URL }}
+        run: |
+          log="$RUNNER_TEMP/push.log"
+          if ! npx --yes supabase@2.115.0 db push --db-url "$DB_URL" --include-all --yes > "$log" 2>&1; then
+            echo "The CLI failed. Its errors:"
+            grep -iE 'error' "$log" | sed -E 's#postgres(ql)?://[^ ]+#[db-url]#g' | cut -c1-300 || true
+            exit 1
+          fi
+          psql "$DB_URL" -X -q -c "notify pgrst, 'reload schema';" > /dev/null
+          echo "Applied. PostgREST was told to reload its schema."
+
+      - name: Check every public table has row-level security
+        env:
+          DB_URL: ${{ secrets.COMPOSA_DB_URL }}
+        run: |
+          off="$(psql "$DB_URL" -X -q -At -c "select count(*) from pg_tables where schemaname='public' and not rowsecurity")"
+          echo "Public tables without row-level security: $off"
+          [ "$off" = 0 ]
+
+      - name: Remove private source
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/psql.log" "$RUNNER_TEMP/push.log" "$RUNNER_TEMP/source-key"

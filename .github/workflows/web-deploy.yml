@@ -1,0 +1,92 @@
+name: Composa web deploy
+
+# Deploys a Composa commit to Vercel. staging makes a preview deployment, which
+# changes nothing users see. production goes live on the project's domains and
+# waits for the required reviewer.
+#
+# Vercel builds the app itself, with its own COMPOSA_UI_TOKEN and VITE_* values.
+# This log is public, so it never prints the deployment URL. Find it with
+# `vercel ls composa-app --scope daris-team`.
+
+run-name: 'Composa web deploy: ${{ inputs.target }}${{ inputs.sha && format('' at {0}'', inputs.sha) || '''' }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Where to deploy
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+      sha:
+        description: Composa commit to deploy instead of main (full SHA)
+        required: false
+        type: string
+
+concurrency:
+  group: composa-web-deploy-${{ inputs.target }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.target == 'production' && 'composa-production' || 'composa-staging' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Choose the commit
+        id: ref
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          [ -z "$SHA" ] || [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be a full 40-character commit"; exit 1; }
+          echo "ref=${SHA:-main}" >> "$GITHUB_OUTPUT"
+
+      - id: source
+        uses: ./.github/actions/fetch-source
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          deploy_key: ${{ secrets.COMPOSA_SOURCE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Deploy
+        working-directory: ${{ runner.temp }}/composa-source
+        env:
+          TARGET: ${{ inputs.target }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: team_QQGshTbgTCAkvBKiUtcJ9Rf1
+          VERCEL_PROJECT_ID: prj_23vfsNmatnLrTZNcl3dAA3qVTJ7B
+        run: |
+          [ -n "$VERCEL_TOKEN" ] || { echo "VERCEL_TOKEN is not set."; exit 1; }
+          args=(deploy --yes --token "$VERCEL_TOKEN")
+          [ "$TARGET" = production ] && args+=(--prod)
+          log="$RUNNER_TEMP/deploy.log"
+          if ! npx --yes vercel@65.9.0 "${args[@]}" > "$log" 2>&1; then
+            echo "The deploy failed. Its errors:"
+            grep -iE 'error' "$log" | sed -E 's#https://[^ ]+#[url]#g' | cut -c1-300 || true
+            rm -f "$log"
+            exit 1
+          fi
+          rm -f "$log"
+          echo "Deployed ${{ steps.source.outputs.sha }} to $TARGET."
+
+      - name: Check the live site answers
+        if: inputs.target == 'production'
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 10 --retry-all-errors https://dev.composa.app/)"
+          echo "dev.composa.app answered $code"
+          [ "$code" = 200 ]
+
+      - name: Remove private source
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/source-key"

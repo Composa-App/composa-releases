@@ -1,0 +1,40 @@
+name: Fetch Composa source
+description: >
+  Clone Composa-App/Composa at a ref with a read-only deploy key, quietly, into
+  $RUNNER_TEMP/composa-source. Prints the commit only. Source never leaves the runner.
+inputs:
+  ref:
+    description: main or a 40-character commit
+    required: true
+  deploy_key:
+    description: The read-only deploy key
+    required: true
+outputs:
+  sha:
+    description: The full commit that was fetched
+    value: ${{ steps.clone.outputs.sha }}
+runs:
+  using: composite
+  steps:
+    - name: Clone quietly
+      id: clone
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+        DEPLOY_KEY: ${{ inputs.deploy_key }}
+      run: |
+        [ "$REF" = main ] || [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be main or a full commit"; exit 1; }
+        [ -n "$DEPLOY_KEY" ] || { echo "No deploy key"; exit 1; }
+        key="$RUNNER_TEMP/source-key"
+        (umask 077; printf '%s\n' "$DEPLOY_KEY" > "$key")
+        src="$RUNNER_TEMP/composa-source"
+        rm -rf "$src" && mkdir -p "$src"
+        export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+        git -C "$src" init -q
+        git -C "$src" remote add origin git@github.com:Composa-App/Composa.git
+        git -C "$src" fetch -q --depth 1 origin "$REF"
+        git -C "$src" checkout -q FETCH_HEAD
+        rm -f "$key"
+        sha="$(git -C "$src" rev-parse HEAD)"
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "Composa $sha"
