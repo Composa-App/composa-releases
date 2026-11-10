@@ -16,5 +16,34 @@ GitHub's free plan only offers required reviewers on public repositories. That r
 | --- | --- | --- |
 | **Composa database ops** (`db-ops.yml`) | Lists pending migrations, proves them in a transaction that rolls back, or applies them with the Supabase CLI | `composa-staging`, `composa-production` |
 | **Composa web deploy** (`web-deploy.yml`) | Deploys a commit to Vercel: a preview for staging, the live site for production | `composa-staging`, `composa-production` |
+| **Composa web tests** (`web-tests-pr.yml`) | Runs Composa's `npm run verify` and the RLS proof at the head of a Composa pull request, and posts the results on that pull request | `composa-staging` |
+| **Composa web tests on a schedule** (`web-tests-schedule.yml`) | Every 15 minutes, dispatches the web tests for one open Composa pull request head that has no run yet | `composa-staging` |
+
+## Free test runs for Composa pull requests
+
+Actions minutes are free on public repositories, so Composa's tests run here
+instead of in Composa's own verify workflow. The schedule picks up each new
+pull request head within about 15 minutes, one run at a time. To test a head
+right away, run **Composa web tests** by hand with the pull request number and
+its head commit.
+
+The log shows only pass or fail and counts per stage. Failing test names, and
+the last lines of a failed build, go to a comment on the Composa pull request,
+which also gets a `composa-releases / web tests` commit status.
+
+Secrets in the `composa-staging` environment:
+
+| Secret | Needed for | What it is |
+| --- | --- | --- |
+| `COMPOSA_SOURCE_DEPLOY_KEY` | fetching the pull request head | already there for the deploy workflows |
+| `COMPOSA_UI_TOKEN` | `npm ci` of the private `@composa/ui` dependency | a read-only token for Composa-UI/react-ui, like the one in Composa's own secrets |
+| `COMPOSA_PR_TOKEN` | posting results; listing open pull requests exactly | a fine-grained token for Composa-App/Composa with Pull requests and Commit statuses set to read and write |
+
+Without `COMPOSA_PR_TOKEN` the tests still run and the run shows pass or fail,
+but nothing is posted on the pull request, and the schedule finds open pull
+requests from their merge refs instead.
+
+Each token is present only in the step that needs it, and removed before any
+Composa code runs.
 
 Every production run waits for a required reviewer to approve it. Runs are started from `main` of this repository only, and take source from `main` of Composa-App/Composa or a full commit given as `sha`.

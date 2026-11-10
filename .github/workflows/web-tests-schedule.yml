@@ -1,0 +1,51 @@
+name: Composa web tests on a schedule
+
+# Every 15 minutes, and by hand: dispatches web-tests-pr.yml for at most one
+# Composa pull request head that has no run yet, and none while a run is going.
+# Prints only pull request numbers and commits, which run names already show.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: composa-web-tests-schedule
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  pick:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: composa-staging
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: List recent test runs, with no Composa credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/ci/schedule.py runs
+
+      - name: Pick an open Composa pull request head with no run yet, with no GitHub token
+        env:
+          COMPOSA_PR_TOKEN: ${{ secrets.COMPOSA_PR_TOKEN }}
+          COMPOSA_SOURCE_DEPLOY_KEY: ${{ secrets.COMPOSA_SOURCE_DEPLOY_KEY }}
+        run: python3 -I -S -B tools/ci/schedule.py pick
+
+      - name: Dispatch the tests for the picked head, with no Composa credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -S -B tools/ci/schedule.py dispatch
+
+      - name: Remove the carried numbers
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/composa-schedule"

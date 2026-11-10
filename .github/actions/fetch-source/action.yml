@@ -2,6 +2,8 @@ name: Fetch Composa source
 description: >
   Clone Composa-App/Composa at a ref with a read-only deploy key, quietly, into
   $RUNNER_TEMP/composa-source. Prints the commit only. Source never leaves the runner.
+  With pr_number, ref must be the full head commit of that pull request: the
+  action fetches refs/pull/<n>/head and refuses a ref that is not its head.
 inputs:
   ref:
     description: main or a 40-character commit
@@ -9,6 +11,10 @@ inputs:
   deploy_key:
     description: The read-only deploy key
     required: true
+  pr_number:
+    description: Optional Composa pull request whose head must equal ref
+    required: false
+    default: ''
 outputs:
   sha:
     description: The full commit that was fetched
@@ -22,8 +28,11 @@ runs:
       env:
         REF: ${{ inputs.ref }}
         DEPLOY_KEY: ${{ inputs.deploy_key }}
+        PR_NUMBER: ${{ inputs.pr_number }}
       run: |
         [ "$REF" = main ] || [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be main or a full commit"; exit 1; }
+        [ -z "$PR_NUMBER" ] || [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,6}$ ]] || { echo "pr_number must be a number"; exit 1; }
+        [ -z "$PR_NUMBER" ] || [ "$REF" != main ] || { echo "With pr_number, ref must be the head commit"; exit 1; }
         [ -n "$DEPLOY_KEY" ] || { echo "No deploy key"; exit 1; }
         key="$RUNNER_TEMP/source-key"
         (umask 077; printf '%s\n' "$DEPLOY_KEY" > "$key")
@@ -32,7 +41,13 @@ runs:
         export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
         git -C "$src" init -q
         git -C "$src" remote add origin git@github.com:Composa-App/Composa.git
-        git -C "$src" fetch -q --depth 1 origin "$REF"
+        if [ -n "$PR_NUMBER" ]; then
+          git -C "$src" fetch -q --depth 1 origin "refs/pull/$PR_NUMBER/head"
+          head="$(git -C "$src" rev-parse FETCH_HEAD)"
+          [ "$head" = "$REF" ] || { rm -f "$key"; echo "Pull request $PR_NUMBER head is $head, not $REF. Skipping a stale request."; exit 1; }
+        else
+          git -C "$src" fetch -q --depth 1 origin "$REF"
+        fi
         git -C "$src" checkout -q FETCH_HEAD
         rm -f "$key"
         sha="$(git -C "$src" rev-parse HEAD)"
