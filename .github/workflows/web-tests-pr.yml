@@ -1,0 +1,138 @@
+name: Composa web tests
+
+# Runs Composa's own checks (Composa's `npm run verify` plus the RLS proof from
+# its verify.yml) at the head of an open Composa pull request, on a free runner.
+#
+# This log is public, so it prints only pass or fail and counts per stage. Every
+# stage's output stays in a private file on the runner, and failing test names
+# go only to the Composa pull request (tools/ci/post_results.py).
+#
+# Credentials, each only where it is needed:
+#   COMPOSA_SOURCE_DEPLOY_KEY  fetch the pull request head (removed right after)
+#   COMPOSA_UI_TOKEN           npm ci of the private @composa/ui dependency (removed right after)
+#   COMPOSA_PR_TOKEN           optional: post results and a commit status on the pull request
+# The checks themselves run with none of them.
+
+run-name: 'Composa web tests for #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open Composa-App/Composa pull request number
+        required: true
+        type: string
+      source_sha:
+        description: That pull request's current 40-character head commit
+        required: true
+        type: string
+
+concurrency:
+  group: composa-web-tests-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: composa-staging
+    timeout-minutes: 75
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check the inputs
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SHA: ${{ inputs.source_sha }}
+        run: |
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,6}$ ]] || { echo "pr_number must be a number"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "source_sha must be a full 40-character commit"; exit 1; }
+
+      - name: Mark the commit as being checked
+        env:
+          COMPOSA_PR_TOKEN: ${{ secrets.COMPOSA_PR_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 -I -S -B tools/ci/post_results.py --pending --pr-number "${{ inputs.pr_number }}" --source-sha "${{ inputs.source_sha }}" --run-url "$RUN_URL"
+
+      - id: source
+        uses: ./.github/actions/fetch-source
+        with:
+          ref: ${{ inputs.source_sha }}
+          pr_number: ${{ inputs.pr_number }}
+          deploy_key: ${{ secrets.COMPOSA_SOURCE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies, with the UI token for this step only
+        working-directory: ${{ runner.temp }}/composa-source
+        env:
+          UI_TOKEN: ${{ secrets.COMPOSA_UI_TOKEN }}
+        run: |
+          [ -n "$UI_TOKEN" ] || { echo "COMPOSA_UI_TOKEN is not set in the composa-staging environment, so npm cannot install @composa/ui."; exit 1; }
+          # npm resolves the private @composa/ui git dependency over SSH; point it at authenticated HTTPS.
+          git config --global url."https://x-access-token:${UI_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://x-access-token:${UI_TOKEN}@github.com/".insteadOf "git@github.com:"
+          status=0
+          npm ci --no-audit --no-fund --loglevel=error > "$RUNNER_TEMP/npm-ci.log" 2>&1 || status=$?
+          # Drop the token before any Composa code runs.
+          git config --global --remove-section url."https://x-access-token:${UI_TOKEN}@github.com/"
+          if [ "$status" != 0 ]; then
+            echo "npm ci failed (exit $status)."
+            grep -oE 'npm (error|ERR!) code [A-Z0-9_]+' "$RUNNER_TEMP/npm-ci.log" | sort -u | head -5 || true
+            rm -f "$RUNNER_TEMP/npm-ci.log"
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/npm-ci.log"
+          echo "Dependencies installed."
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles(format('{0}/composa-source/package-lock.json', runner.temp)) }}
+
+      - name: Install Playwright chromium
+        working-directory: ${{ runner.temp }}/composa-source
+        env:
+          CACHE_HIT: ${{ steps.playwright-cache.outputs.cache-hit }}
+        run: |
+          if [ "$CACHE_HIT" = "true" ]; then
+            npx playwright install-deps chromium > /dev/null
+          else
+            npx playwright install --with-deps chromium > /dev/null
+          fi
+          echo "Chromium ready."
+
+      - name: Run the checks with no credential, printing only pass or fail and counts
+        run: python3 -I -S -B tools/ci/run_checks.py
+
+      - name: Post the results on the Composa pull request, never in this log
+        if: always() && steps.source.outcome == 'success'
+        env:
+          COMPOSA_PR_TOKEN: ${{ secrets.COMPOSA_PR_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 -I -S -B tools/ci/post_results.py --pr-number "${{ inputs.pr_number }}" --source-sha "${{ inputs.source_sha }}" --run-url "$RUN_URL"
+
+      - name: Remove private source, logs and dependencies
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/composa-private" "$RUNNER_TEMP/source-key"
