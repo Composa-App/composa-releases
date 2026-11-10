@@ -1,7 +1,9 @@
 name: Composa web tests
 
 # Runs Composa's own checks (Composa's `npm run verify` plus the RLS proof from
-# its verify.yml) at the head of an open Composa pull request, on a free runner.
+# its verify.yml) at the head of an open Composa pull request, on a free runner,
+# and deploys that head to a Vercel preview linked on the pull request, as
+# Composa's own pr-preview.yml did.
 #
 # This log is public, so it prints only pass or fail and counts per stage. Every
 # stage's output stays in a private file on the runner, and failing test names
@@ -10,7 +12,8 @@ name: Composa web tests
 # Credentials, each only where it is needed:
 #   COMPOSA_SOURCE_DEPLOY_KEY  fetch the pull request head (removed right after)
 #   COMPOSA_UI_DEPLOY_KEY      read-only deploy key on Composa-UI/react-ui, for npm ci of @composa/ui (removed right after)
-#   COMPOSA_PR_TOKEN           optional: post results and a commit status on the pull request
+#   COMPOSA_PR_TOKEN           optional: post results, a commit status and the preview link on the pull request
+#   VERCEL_TOKEN               deploy the head to a Vercel preview (the preview job, only when COMPOSA_PR_TOKEN is set)
 # The checks themselves run with none of them.
 
 run-name: 'Composa web tests for #${{ inputs.pr_number }} at ${{ inputs.source_sha }}'
@@ -141,3 +144,87 @@ jobs:
       - name: Remove private source, logs and dependencies
         if: always()
         run: rm -rf -- "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/composa-private" "$RUNNER_TEMP/source-key" "$RUNNER_TEMP/ui-key"
+
+  preview:
+    # Deploys the same head to a Vercel preview (Vercel's Preview settings, which
+    # point at composa-staging) and links it on the Composa pull request. The
+    # pull request's code is only uploaded for Vercel to build; it is never
+    # installed or run here. The link goes only to the pull request, never this log.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: composa-staging
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check the inputs, and that the link can be posted
+        id: check
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SHA: ${{ inputs.source_sha }}
+          COMPOSA_PR_TOKEN: ${{ secrets.COMPOSA_PR_TOKEN }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,6}$ ]] || { echo "pr_number must be a number"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "source_sha must be a full 40-character commit"; exit 1; }
+          [ -n "$VERCEL_TOKEN" ] || { echo "VERCEL_TOKEN is not set in the composa-staging environment."; exit 1; }
+          if [ -z "$COMPOSA_PR_TOKEN" ]; then
+            echo "COMPOSA_PR_TOKEN is not set, so the preview link could not be posted. Skipping the preview."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: source
+        if: steps.check.outputs.run == 'true'
+        uses: ./.github/actions/fetch-source
+        with:
+          ref: ${{ inputs.source_sha }}
+          pr_number: ${{ inputs.pr_number }}
+          deploy_key: ${{ secrets.COMPOSA_SOURCE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.check.outputs.run == 'true'
+        with:
+          node-version: '24'
+
+      # Vercel files toolbar comments under the git branch it sees, and the
+      # checkout is a detached HEAD.
+      - name: Name the branch for Vercel
+        if: steps.check.outputs.run == 'true'
+        working-directory: ${{ runner.temp }}/composa-source
+        run: git checkout -q -B "pr-${{ inputs.pr_number }}"
+
+      - name: Deploy the preview, printing no link
+        if: steps.check.outputs.run == 'true'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: team_QQGshTbgTCAkvBKiUtcJ9Rf1
+          VERCEL_PROJECT_ID: prj_23vfsNmatnLrTZNcl3dAA3qVTJ7B
+        # Run from outside the source so npx can't pick up the pull request's npm config.
+        run: |
+          cd "$RUNNER_TEMP"
+          private="$RUNNER_TEMP/composa-private"
+          (umask 077; mkdir -p "$private")
+          log="$private/preview-deploy.log"
+          if ! npx --yes vercel@65.9.0 deploy "$RUNNER_TEMP/composa-source" --yes --token "$VERCEL_TOKEN" > "$private/preview-url" 2> "$log"; then
+            echo "The preview deploy failed. Its errors:"
+            grep -iE 'error' "$log" | sed -E 's#https://[^ ]+#[url]#g' | cut -c1-300 || true
+            rm -f "$log" "$private/preview-url"
+            exit 1
+          fi
+          rm -f "$log"
+          echo "Deployed ${{ steps.source.outputs.sha }} to a preview."
+
+      - name: Link the preview on the Composa pull request, never in this log
+        if: steps.check.outputs.run == 'true'
+        env:
+          COMPOSA_PR_TOKEN: ${{ secrets.COMPOSA_PR_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 -I -S -B tools/ci/post_preview.py --pr-number "${{ inputs.pr_number }}" --source-sha "${{ inputs.source_sha }}" --run-url "$RUN_URL"
+
+      - name: Remove private source and the link
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/composa-private" "$RUNNER_TEMP/source-key"
