@@ -9,7 +9,7 @@ name: Composa web tests
 #
 # Credentials, each only where it is needed:
 #   COMPOSA_SOURCE_DEPLOY_KEY  fetch the pull request head (removed right after)
-#   COMPOSA_UI_TOKEN           npm ci of the private @composa/ui dependency (removed right after)
+#   COMPOSA_UI_DEPLOY_KEY      read-only deploy key on Composa-UI/react-ui, for npm ci of @composa/ui (removed right after)
 #   COMPOSA_PR_TOKEN           optional: post results and a commit status on the pull request
 # The checks themselves run with none of them.
 
@@ -82,19 +82,24 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install dependencies, with the UI token for this step only
+      - name: Install dependencies, with the UI deploy key for this step only
         working-directory: ${{ runner.temp }}/composa-source
         env:
-          UI_TOKEN: ${{ secrets.COMPOSA_UI_TOKEN }}
+          UI_DEPLOY_KEY: ${{ secrets.COMPOSA_UI_DEPLOY_KEY }}
         run: |
-          [ -n "$UI_TOKEN" ] || { echo "COMPOSA_UI_TOKEN is not set in the composa-staging environment, so npm cannot install @composa/ui."; exit 1; }
-          # npm resolves the private @composa/ui git dependency over SSH; point it at authenticated HTTPS.
-          git config --global url."https://x-access-token:${UI_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
-          git config --global --add url."https://x-access-token:${UI_TOKEN}@github.com/".insteadOf "git@github.com:"
+          [ -n "$UI_DEPLOY_KEY" ] || { echo "COMPOSA_UI_DEPLOY_KEY is not set in the composa-staging environment, so npm cannot install @composa/ui."; exit 1; }
+          key="$RUNNER_TEMP/ui-key"
+          (umask 077; printf '%s\n' "$UI_DEPLOY_KEY" > "$key")
+          # @composa/ui is a private git dependency; fetch it over SSH with the read-only deploy key,
+          # whichever form (https, ssh or scp-style) the lockfile names it by.
+          git config --global url."ssh://git@github.com/Composa-UI/".insteadOf "https://github.com/Composa-UI/"
+          git config --global --add url."ssh://git@github.com/Composa-UI/".insteadOf "git@github.com:Composa-UI/"
           status=0
-          npm ci --no-audit --no-fund --loglevel=error > "$RUNNER_TEMP/npm-ci.log" 2>&1 || status=$?
-          # Drop the token before any Composa code runs.
-          git config --global --remove-section url."https://x-access-token:${UI_TOKEN}@github.com/"
+          GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            npm ci --no-audit --no-fund --loglevel=error > "$RUNNER_TEMP/npm-ci.log" 2>&1 || status=$?
+          # Drop the key and the rewrite before any Composa code runs.
+          rm -f "$key"
+          git config --global --remove-section url."ssh://git@github.com/Composa-UI/"
           if [ "$status" != 0 ]; then
             echo "npm ci failed (exit $status)."
             grep -oE 'npm (error|ERR!) code [A-Z0-9_]+' "$RUNNER_TEMP/npm-ci.log" | sort -u | head -5 || true
@@ -135,4 +140,4 @@ jobs:
 
       - name: Remove private source, logs and dependencies
         if: always()
-        run: rm -rf -- "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/composa-private" "$RUNNER_TEMP/source-key"
+        run: rm -rf -- "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/composa-private" "$RUNNER_TEMP/source-key" "$RUNNER_TEMP/ui-key"
