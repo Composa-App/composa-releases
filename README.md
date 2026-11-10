@@ -36,7 +36,7 @@ Secrets in the `composa-staging` environment:
 | Secret | Needed for | What it is |
 | --- | --- | --- |
 | `COMPOSA_SOURCE_DEPLOY_KEY` | fetching the pull request head | already there for the deploy workflows |
-| `COMPOSA_UI_TOKEN` | `npm ci` of the private `@composa/ui` dependency | a read-only token for Composa-UI/react-ui, like the one in Composa's own secrets |
+| `COMPOSA_UI_DEPLOY_KEY` | `npm ci` of the private `@composa/ui` dependency | a read-only deploy key on Composa-UI/react-ui (Bitwarden: COMPOSA_RELEASES_UI_DEPLOY_KEY) |
 | `COMPOSA_PR_TOKEN` | posting results; listing open pull requests exactly | a fine-grained token for Composa-App/Composa with Pull requests and Commit statuses set to read and write |
 
 Without `COMPOSA_PR_TOKEN` the tests still run and the run shows pass or fail,
