@@ -15,6 +15,9 @@ name: Composa web deploy
 # recording_alias (staging only) does the same for
 # composa-recording-daris-team.vercel.app, so a second build can be tested in
 # parallel without moving the review address. review_alias wins if both are set.
+#
+# aichat_alias (staging only) does the same for composa-aichat-daris-team.vercel.app,
+# for the AI chat build. Order when more than one is set: review, recording, aichat.
 
 run-name: 'Composa web deploy: ${{ inputs.target }}${{ inputs.sha && format('' at {0}'', inputs.sha) || '''' }}'
 
@@ -38,6 +41,11 @@ on:
         type: boolean
       recording_alias:
         description: Staging only. Point composa-recording-daris-team.vercel.app at this preview instead
+        required: false
+        default: false
+        type: boolean
+      aichat_alias:
+        description: Staging only. Point composa-aichat-daris-team.vercel.app at this preview instead
         required: false
         default: false
         type: boolean
@@ -102,9 +110,9 @@ jobs:
           echo "Deployed ${{ steps.source.outputs.sha }} to $TARGET."
 
       - name: Point the review address at this preview
-        if: inputs.target == 'staging' && (inputs.review_alias || inputs.recording_alias)
+        if: inputs.target == 'staging' && (inputs.review_alias || inputs.recording_alias || inputs.aichat_alias)
         env:
-          ADDRESS: ${{ inputs.review_alias && 'composa-review-daris-team.vercel.app' || 'composa-recording-daris-team.vercel.app' }}
+          ADDRESS: ${{ inputs.review_alias && 'composa-review-daris-team.vercel.app' || inputs.recording_alias && 'composa-recording-daris-team.vercel.app' || 'composa-aichat-daris-team.vercel.app' }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: team_QQGshTbgTCAkvBKiUtcJ9Rf1
           VERCEL_PROJECT_ID: prj_23vfsNmatnLrTZNcl3dAA3qVTJ7B
