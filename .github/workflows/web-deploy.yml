@@ -7,6 +7,10 @@ name: Composa web deploy
 # Vercel builds the app itself, with its own COMPOSA_UI_TOKEN and VITE_* values.
 # This log is public, so it never prints the deployment URL. Find it with
 # `vercel ls composa-app --scope daris-team`.
+#
+# review_alias (staging only) also points composa-review-daris-team.vercel.app at
+# the new preview, so the same address always shows the newest review build and
+# a browser only has to allow one site.
 
 run-name: 'Composa web deploy: ${{ inputs.target }}${{ inputs.sha && format('' at {0}'', inputs.sha) || '''' }}'
 
@@ -23,6 +27,11 @@ on:
         description: Composa commit to deploy instead of main (full SHA)
         required: false
         type: string
+      review_alias:
+        description: Staging only. Also point composa-review-daris-team.vercel.app at this preview
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: composa-web-deploy-${{ inputs.target }}
@@ -71,14 +80,38 @@ jobs:
           args=(deploy --yes --token "$VERCEL_TOKEN")
           [ "$TARGET" = production ] && args+=(--prod)
           log="$RUNNER_TEMP/deploy.log"
-          if ! npx --yes vercel@65.9.0 "${args[@]}" > "$log" 2>&1; then
+          url_file="$RUNNER_TEMP/deploy.url"
+          # The CLI prints the deployment URL on stdout and progress on stderr.
+          if ! npx --yes vercel@65.9.0 "${args[@]}" > "$url_file" 2> "$log"; then
             echo "The deploy failed. Its errors:"
+            cat "$url_file" >> "$log"
+            grep -iE 'error' "$log" | sed -E 's#https://[^ ]+#[url]#g' | cut -c1-300 || true
+            rm -f "$log" "$url_file"
+            exit 1
+          fi
+          rm -f "$log"
+          echo "Deployed ${{ steps.source.outputs.sha }} to $TARGET."
+
+      - name: Point the review address at this preview
+        if: inputs.target == 'staging' && inputs.review_alias
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: team_QQGshTbgTCAkvBKiUtcJ9Rf1
+          VERCEL_PROJECT_ID: prj_23vfsNmatnLrTZNcl3dAA3qVTJ7B
+        run: |
+          url_file="$RUNNER_TEMP/deploy.url"
+          url="$(grep -oE 'https://[a-z0-9.-]+\.vercel\.app' "$url_file" | tail -n1)"
+          rm -f "$url_file"
+          [ -n "$url" ] || { echo "Could not find the preview URL in the deploy output."; exit 1; }
+          log="$RUNNER_TEMP/alias.log"
+          if ! npx --yes vercel@65.9.0 alias set "$url" composa-review-daris-team.vercel.app --token "$VERCEL_TOKEN" --scope daris-team > "$log" 2>&1; then
+            echo "Setting the review address failed. Its errors:"
             grep -iE 'error' "$log" | sed -E 's#https://[^ ]+#[url]#g' | cut -c1-300 || true
             rm -f "$log"
             exit 1
           fi
           rm -f "$log"
-          echo "Deployed ${{ steps.source.outputs.sha }} to $TARGET."
+          echo "composa-review-daris-team.vercel.app now shows ${{ steps.source.outputs.sha }}."
 
       - name: Check the live site answers
         if: inputs.target == 'production'
@@ -89,4 +122,4 @@ jobs:
 
       - name: Remove private source
         if: always()
-        run: rm -rf "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/source-key"
+        run: rm -rf "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/source-key" "$RUNNER_TEMP/deploy.url"
