@@ -13,6 +13,7 @@ Usage: python3 -I -S -B tools/ci/run_checks.py [--only STAGE ...]
 
 import argparse
 import json
+import re
 import os
 import subprocess
 import sys
@@ -67,6 +68,22 @@ def vitest_counts(stage_dir):
     }, failed
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def failure_reason(test):
+    """The first meaningful line of the last attempt's error, so a failing test
+    says why on the pull request instead of only that it failed."""
+    results = test.get("results") or []
+    error = (results[-1].get("error") or {}) if results else {}
+    message = ANSI.sub("", error.get("message") or "")
+    lines = [line.strip() for line in message.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    reason = " / ".join(lines[:3]).replace("`", "'")
+    return reason[:300] + ("…" if len(reason) > 300 else "")
+
+
 def playwright_counts(stage_dir):
     with open(os.path.join(stage_dir, "playwright.json")) as f:
         data = json.load(f)
@@ -79,7 +96,9 @@ def playwright_counts(stage_dir):
         for spec in suite.get("specs", []):
             for test in spec.get("tests", []):
                 if test.get("status") == "unexpected":
-                    failed.append(" > ".join(here + [spec.get("title", "")]))
+                    label = " > ".join(here + [spec.get("title", "")])
+                    reason = failure_reason(test)
+                    failed.append(f"{label}: {reason}" if reason else label)
         for child in suite.get("suites", []):
             walk(child, here)
 
