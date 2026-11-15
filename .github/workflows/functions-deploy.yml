@@ -1,0 +1,87 @@
+name: Composa functions deploy
+
+# Deploys one Supabase Edge Function from Composa-App/Composa to the
+# composa-staging project. Staging only: production is not an option here.
+#
+# It runs in the `composa-staging` environment and needs that environment's
+# SUPABASE_ACCESS_TOKEN (a Supabase personal access token). The project ref is
+# fixed in this file, so the token can only be used against staging here.
+# Function secrets (like ELEVENLABS_API_KEY) are not touched.
+#
+# This log is public. It prints the function name, the commit and the CLI's
+# error lines only.
+
+run-name: 'Composa functions deploy: ${{ inputs.function }}${{ inputs.sha && format('' at {0}'', inputs.sha) || '''' }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      function:
+        description: Which function
+        required: true
+        default: voice
+        type: choice
+        options: [voice, agent-chat, figma-oauth, send-invitation, submit-feedback]
+      sha:
+        description: Composa commit to deploy instead of main (full SHA)
+        required: false
+        type: string
+
+concurrency:
+  group: composa-functions-deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: composa-staging
+    timeout-minutes: 15
+    env:
+      PROJECT_REF: rvhuftpjserbzyyxnmdz
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check the token is there
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          [ -n "$SUPABASE_ACCESS_TOKEN" ] || { echo "composa-staging is missing SUPABASE_ACCESS_TOKEN."; exit 1; }
+          echo "token present"
+
+      - name: Choose the commit
+        id: ref
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          [ -z "$SHA" ] || [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be a full 40-character commit"; exit 1; }
+          echo "ref=${SHA:-main}" >> "$GITHUB_OUTPUT"
+
+      - id: source
+        uses: ./.github/actions/fetch-source
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          deploy_key: ${{ secrets.COMPOSA_SOURCE_DEPLOY_KEY }}
+
+      - name: Deploy
+        working-directory: ${{ runner.temp }}/composa-source
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          FUNCTION: ${{ inputs.function }}
+        run: |
+          [ -f "supabase/functions/$FUNCTION/index.ts" ] || { echo "No function named $FUNCTION at this commit."; exit 1; }
+          log="$RUNNER_TEMP/deploy.log"
+          if ! npx --yes supabase@2.115.0 functions deploy "$FUNCTION" --project-ref "$PROJECT_REF" --use-api > "$log" 2>&1; then
+            echo "The CLI failed. Its errors:"
+            grep -iE 'error|failed' "$log" | sed -E 's#sbp_[A-Za-z0-9]+#[token]#g' | cut -c1-300 || true
+            exit 1
+          fi
+          echo "Deployed $FUNCTION to staging from ${{ steps.source.outputs.sha }}."
+
+      - name: Remove private source
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/composa-source" "$RUNNER_TEMP/deploy.log" "$RUNNER_TEMP/source-key"
